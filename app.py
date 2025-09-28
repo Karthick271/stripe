@@ -189,11 +189,11 @@ def create_bigin_deal(contact_id: str, session_obj: dict) -> str:
         "Pipeline": {"id": PIPELINE_ID} if PIPELINE_ID else None,
         "Sub_Pipeline": SUB_PIPELINE,
         "Stage": STAGE_NAME,
-        "Amount": amount,
+        "Contribution_Amount": amount,
         "Closing_Date": closing,
         "Contact_Name": {"id": contact_id} if contact_id else None,
         # ✅ Extra fields you asked
-        "Payment_Status": session_obj.get("payment_status"),
+        "Payment_Status":  "Received", #session_obj.get("payment_status"),
         "Payment_Method": ",".join(session_obj.get("payment_method_types", [])) if session_obj.get("payment_method_types") else None,
     }
 
@@ -222,10 +222,12 @@ def update_bigin_deal(deal_id: str, session_obj: dict, contact_id: str = None):
     url = f"{base}/bigin/v2/Pipelines/{deal_id}"  # ✅ update endpoint for Pipelines
 
     STAGE_NAME = os.getenv("ZOHO_BIGIN_STAGE", "Unreconciled Donations")
+    amount    = (session_obj.get("amount_total", 0) or 0) / 100.0
 
     update_data = {
         "Stage": STAGE_NAME,
-        "Payment_Status": session_obj.get("payment_status"),
+        "Contribution_Amount": amount,
+        "Payment_Status":  "Received", #session_obj.get("payment_status"),
         "Payment_Method": ",".join(session_obj.get("payment_method_types", [])) if session_obj.get("payment_method_types") else None,
         "Closing_Date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "Contact_Name": {"id": contact_id} if contact_id else None,
