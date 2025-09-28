@@ -1,5 +1,5 @@
 <!doctype html>
-<title>Zoho CRM OAuth</title>
+<title>ZohoBigin  OAuth</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root{
@@ -42,7 +42,7 @@
 <div class="container">
   <!-- ZOHO CONNECTION -->
   <div class="card">
-    <h2>Zoho CRM Connection</h2>
+    <h2>ZohoBigin Connection</h2>
     {% if connected %}
       <p>✅ Connected. Access token auto-refreshes using stored refresh token.</p>
       <form method="post" action="/disconnect" onsubmit="return confirm('Disconnect Zoho?');" style="margin-top:10px">
@@ -212,13 +212,33 @@
       }
     });
 
-    copyBtn.addEventListener('click', () => {
-      const text = urlEl.textContent || '';
-      if (!text) return;
-      navigator.clipboard.writeText(text).then(() => {
-        statusEl.textContent = 'Copied!';
-        setTimeout(() => statusEl.textContent = '', 1500);
-      });
-    });
+   copyBtn.addEventListener('click', async () => {
+  const text = urlEl.textContent || '';
+  if (!text) return;
+
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // Fallback for HTTP / older browsers
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (!ok) throw new Error('execCommand failed');
+    }
+    statusEl.textContent = 'Copied!';
+  } catch {
+    statusEl.textContent = 'Copy failed. Long-press to select.';
+  } finally {
+    setTimeout(() => (statusEl.textContent = ''), 1500);
+  }
+});
+
   }
 </script>
