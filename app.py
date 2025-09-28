@@ -7,7 +7,41 @@ from flask import Flask, request, send_file, jsonify, abort
 from dotenv import load_dotenv
 import stripe
 from playwright.async_api import async_playwright
+import requests
+from datetime import datetime
 
+
+from flask import Flask, request, send_file, jsonify, abort, render_template, session, redirect
+
+# replace this line:
+# load_dotenv("/opt/python/.env")
+# with:
+import os
+from dotenv import load_dotenv
+load_dotenv(os.getenv("DOTENV_FILE", ".env"))
+
+# set a secret key (needed for session):
+import secrets
+app = Flask(__name__)
+# at top (config)
+DISABLE_OAUTH_STATE = os.getenv("DISABLE_OAUTH_STATE", "true").lower() == "true"
+
+# import zoho oauth helpers + constants
+from zoho_oauth import (
+    zoho_authorize_url,
+    zoho_exchange_code_for_tokens,
+    zoho_revoke_token,
+    save_tokens_for_user,
+    get_access_token_by_user,
+    get_latest_row_for_user,
+    get_zoho_api_base,
+    # constants used by your template/routes:
+    ZOHO_USER_ID,
+    ZOHO_OAUTH_SCOPE,
+    ZOHO_REDIRECT_URI,
+    ZOHO_ACCOUNTS_URL,
+    ZOHO_API_DOMAIN,
+)
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -15,6 +49,40 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
+import requests as _requests
+import logging
+
+# save original implementation
+_orig_request = _requests.Session.request
+
+def _logging_request(self, method, url, **kwargs):
+    body_preview = None
+    if "json" in kwargs:
+        try:
+            import json
+            body_preview = json.dumps(kwargs["json"], ensure_ascii=False)
+        except Exception:
+            body_preview = str(kwargs["json"])
+    elif "data" in kwargs:
+        body_preview = str(kwargs["data"])
+    elif "params" in kwargs:
+        body_preview = f"params={kwargs['params']}"
+
+    logging.info(f"[HTTP-REQ] {method.upper()} {url}")
+    if body_preview:
+        logging.info(f"[HTTP-REQ-BODY] {body_preview}")
+
+    resp = _orig_request(self, method, url, **kwargs)
+
+    text_preview = resp.text
+    if len(text_preview) > 400:
+        text_preview = text_preview[:400] + "…"
+
+    logging.info(f"[HTTP-RESP] {resp.status_code} {url} -> {text_preview}")
+    return resp
+
+# 🔥 monkey-patch globally
+_requests.Session.request = _logging_request
 # Load environment
 load_dotenv("/opt/python/.env")
 
@@ -24,6 +92,11 @@ app = Flask(__name__)
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 WEBHOOK_LOGFILE = os.getenv("WEBHOOK_LOGFILE", "/var/log/stripe_webhook.log")
+
+# Zoho config
+ZOHO_ACCESS_TOKEN = os.getenv("ZOHO_ACCESS_TOKEN")  # generate & paste from Zoho
+ZOHO_API_DOMAIN = os.getenv("ZOHO_API_DOMAIN", "www.zohoapis.com")
+
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -67,6 +140,59 @@ def convert_html_to_pdf():
 # ----------------------------
 
 
+def zoho_headers():
+    token = get_access_token_by_user(ZOHO_USER_ID)
+    if not token:
+        abort(401, description="Zoho not connected")
+    return {
+        "Authorization": f"Zoho-oauthtoken {token}",
+        "Content-Type": "application/json"
+    }
+
+
+def create_contact(customer_details: dict) -> str:
+    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Contacts"
+    payload = {
+        "data": [{
+            "Last_Name": customer_details.get("name") or "Unknown",
+            "Email": customer_details.get("email"),
+            "Phone": customer_details.get("phone"),
+        }]
+    }
+    resp = requests.post(url, json=payload, headers=zoho_headers())
+    resp.raise_for_status()
+    return resp.json()["data"][0]["details"]["id"]
+
+def create_deal(contact_id: str, session_obj: dict) -> str:
+    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Deals"
+    payload = {
+        "data": [{
+            "Deal_Name": f"Payment {session_obj.get('id')}",
+            "Amount": session_obj.get("amount_total", 0) / 100,
+            "Closing_Date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "Contact_Name": {"id": contact_id}
+        }]
+    }
+    resp = requests.post(url, json=payload, headers=zoho_headers())
+    resp.raise_for_status()
+    return resp.json()["data"][0]["details"]["id"]
+
+def update_deal(deal_id: str, session_obj: dict, contact_id: str):
+    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Deals/{deal_id}"
+    payload = {
+        "data": [{
+            # ⚠️ Replace with your actual Zoho field API names
+            "Contribution_Amount": session_obj.get("amount_total", 0) / 100,
+            "Payment_Status": session_obj.get("payment_status"),
+            "Payment_Method": ",".join(session_obj.get("payment_method_types", [])),
+            "Donation_Name": session_obj.get("metadata", {}).get("donation_name", ""),
+            "Sub_Pipeline_and_Stage": "Closed Won",  # replace with your stage field API name
+            "Contact_Name": {"id": contact_id}
+        }]
+    }
+    resp = requests.put(url, json=payload, headers=zoho_headers())
+    resp.raise_for_status()
+    return resp.json()
 
 
 
@@ -157,6 +283,24 @@ def stripe_webhook():
 
     logging.info(f"Received Stripe event: {event_id} {event_type}")
     logging.info(f"Payload logged to {WEBHOOK_LOGFILE}")
+ # --- NEW ZOHO INTEGRATION ---
+    if event_type == "checkout.session.completed":
+        session = event["data"]["object"]
+        metadata = session.get("metadata", {}) or {}
+
+        deal_id = metadata.get("deal_id")
+        contact_id = metadata.get("contact_id")
+
+        # If no contact → create
+        if not contact_id:
+            contact_id = create_contact(session.get("customer_details", {}))
+
+        # If no deal → create
+        if not deal_id:
+            deal_id = create_deal(contact_id, session)
+
+        # Always update the deal
+        update_deal(deal_id, session, contact_id)
 
     return jsonify({"received": True}), 200
 
@@ -252,5 +396,73 @@ def create_payment_link():
         return jsonify({"error": str(ex)}), 500
 
 
+
+
+
+# ------------------------------------------------------------------------------
+# Zoho: minimal UI + routes
+# ------------------------------------------------------------------------------
+@app.route("/zoho", methods=["GET"])
+def zoho_page():
+    row = get_latest_row_for_user(ZOHO_USER_ID)
+    connected = row is not None
+    return render_template(
+        "zoho.html",
+        connected=connected,
+        accounts_url=ZOHO_ACCOUNTS_URL,
+        scope=ZOHO_OAUTH_SCOPE,
+        redirect_uri=ZOHO_REDIRECT_URI
+    )
+
+# /auth
+@app.route("/auth", methods=["GET"])
+def auth():
+    state = "nostate"
+    return redirect(zoho_authorize_url(state))
+
+# /callback
+@app.route("/callback", methods=["GET"])
+def callback():
+    if request.args.get("error"):
+        return abort(400, description=request.args["error"])
+    code = request.args.get("code")
+    if not code:
+        return abort(400, description="missing code")
+    # no state check in prototype
+    token_res = zoho_exchange_code_for_tokens(code)
+    if not token_res.get("access_token") or not token_res.get("refresh_token"):
+        return abort(500, description="Token exchange failed")
+    save_tokens_for_user(ZOHO_USER_ID, token_res)
+    return redirect("/zoho")
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    row = get_latest_row_for_user(ZOHO_USER_ID)
+    if row and row.get("Refresh_Token"):
+        try:
+            status, body = zoho_revoke_token(row["Refresh_Token"])
+            logging.info("Zoho revoke status=%s body=%s", status, body)
+        except Exception:
+            logging.exception("Zoho revoke failed (continuing to clear local tokens)")
+    clear_tokens_for_user(ZOHO_USER_ID)
+    return redirect("/zoho")
+
+@app.route("/zoho/me", methods=["GET"])
+def zoho_me():
+    token = get_access_token_by_user(ZOHO_USER_ID)
+    if not token:
+        return abort(401, description="Zoho not connected")
+
+    base = get_zoho_api_base()
+    url = f"https://accounts.zoho.eu/oauth/user/info"
+
+    resp = requests.get(url, headers={"Authorization": f"Zoho-oauthtoken {token}"}, timeout=20)
+
+    if resp.status_code >= 400:
+        return abort(resp.status_code, resp.text)
+
+    return jsonify(resp.json())
+
+    
 if __name__ == '__main__':
     app.run(debug=True, host="0.0.0.0", port=8000)

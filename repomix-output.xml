@@ -1,0 +1,899 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+templates/
+  zoho.html
+.gitignore
+app.py
+install_stripe_tar.sh
+README.md
+run_stripe_listen.sh
+schema.sql
+setup_stripe_listen.sh
+zoho_oauth.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="templates/zoho.html">
+<!doctype html>
+<title>Zoho CRM OAuth</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; }
+  .card { max-width: 560px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 14px; }
+  button, .btn { display: inline-block; padding: 10px 16px; border-radius: 10px; border: 0; cursor: pointer; }
+  .primary { background: black; color: white; }
+  .danger { background: #ef4444; color: white; }
+  .muted { color: #6b7280; }
+  code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+</style>
+<div class="card">
+  <h2>Zoho CRM Connection</h2>
+  {% if connected %}
+    <p>✅ Connected. Access token auto-refreshes using stored refresh token.</p>
+    <form method="post" action="/disconnect" onsubmit="return confirm('Disconnect Zoho?');">
+      <button class="danger">Disconnect</button>
+    </form>
+  {% else %}
+    <p class="muted">Not connected.</p>
+    <a class="btn primary" href="/auth">Connect Zoho</a>
+  {% endif %}
+  <hr/>
+  <p class="muted">
+    Accounts DC: <code>{{ accounts_url }}</code> &middot; Scope: <code>{{ scope }}</code><br/>
+    Redirect URI: <code>{{ redirect_uri }}</code>
+  </p>
+</div>
+</file>
+
+<file path="schema.sql">
+-- Mirrors your sample table, tuned for SQLite types
+CREATE TABLE IF NOT EXISTS Zoho_Channels (
+    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+    Account_Id TEXT DEFAULT NULL,
+    Access_Token TEXT DEFAULT NULL,
+    Refresh_Token TEXT DEFAULT NULL,
+    AT_Expiry INTEGER DEFAULT NULL,
+    RT_Expiry INTEGER DEFAULT NULL,
+    Created_Time INTEGER NOT NULL,
+    Modified_Time INTEGER NOT NULL,
+    Domain TEXT DEFAULT NULL,
+    User_Id INTEGER DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_Zoho_Channels_UserId ON Zoho_Channels(User_Id);
+</file>
+
+<file path="zoho_oauth.py">
+import os
+import sqlite3
+import time
+from pathlib import Path
+from urllib.parse import urlencode
+import logging
+import requests
+
+# ------------ Config (env-driven) ------------
+# DB in **current working directory** by default
+ZOHO_TOKEN_DB = os.getenv("ZOHO_TOKEN_DB", str(Path.cwd() / "zoho_oauth.sqlite"))
+
+# hardcoded prototype user id
+ZOHO_USER_ID = int(os.getenv("ZOHO_USER_ID", "1"))
+
+# Zoho OAuth app
+ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
+ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
+ZOHO_REDIRECT_URI = os.getenv("ZOHO_REDIRECT_URI")  # must match Zoho console
+ZOHO_ACCOUNTS_URL = os.getenv("ZOHO_ACCOUNTS_URL", "accounts.zoho.com")
+ZOHO_OAUTH_SCOPE = os.getenv("ZOHO_OAUTH_SCOPE", "ZohoCRM.modules.ALL")
+
+# API domain for CRM requests (may be overridden by api_domain in token response)
+ZOHO_API_DOMAIN = os.getenv("ZOHO_API_DOMAIN", "www.zohoapis.com")
+
+
+# ------------ Storage ------------
+def _db():
+    conn = sqlite3.connect(ZOHO_TOKEN_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS Zoho_Channels (
+        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+        Account_Id TEXT DEFAULT NULL,
+        Access_Token TEXT DEFAULT NULL,
+        Refresh_Token TEXT DEFAULT NULL,
+        AT_Expiry INTEGER DEFAULT NULL,
+        RT_Expiry INTEGER DEFAULT NULL,
+        Created_Time INTEGER NOT NULL,
+        Modified_Time INTEGER NOT NULL,
+        Domain TEXT DEFAULT NULL,
+        User_Id INTEGER DEFAULT NULL
+    )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_Zoho_Channels_UserId ON Zoho_Channels(User_Id)")
+    return conn
+
+def _now() -> int:
+    return int(time.time())
+
+def get_latest_row_for_user(user_id: int):
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM Zoho_Channels WHERE User_Id=? ORDER BY Id DESC LIMIT 1",
+            (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+def _insert_row(user_id: int, access: str, refresh: str, at_exp: int, rt_exp: int|None, domain: str|None, account_id: str|None):
+    now = _now()
+    with _db() as conn:
+        conn.execute("""
+        INSERT INTO Zoho_Channels (Account_Id, Access_Token, Refresh_Token, AT_Expiry, RT_Expiry, 
+                                   Created_Time, Modified_Time, Domain, User_Id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (account_id, access, refresh, at_exp, rt_exp, now, now, domain, user_id))
+        conn.commit()
+
+def _update_row(id_: int, *, access: str|None=None, refresh: str|None=None,
+                at_exp: int|None=None, rt_exp: int|None=None, domain: str|None=None):
+    sets, vals = [], []
+    if access is not None: sets.append("Access_Token=?"); vals.append(access)
+    if refresh is not None: sets.append("Refresh_Token=?"); vals.append(refresh)
+    if at_exp is not None: sets.append("AT_Expiry=?"); vals.append(at_exp)
+    if rt_exp is not None: sets.append("RT_Expiry=?"); vals.append(rt_exp)
+    if domain is not None: sets.append("Domain=?"); vals.append(domain)
+    sets.append("Modified_Time=?"); vals.append(_now())
+    vals.append(id_)
+    with _db() as conn:
+        conn.execute(f"UPDATE Zoho_Channels SET {', '.join(sets)} WHERE Id=?", vals)
+        conn.commit()
+
+def save_tokens_for_user(user_id: int, token_json: dict):
+    access = token_json.get("access_token")
+    refresh = token_json.get("refresh_token")  # often absent on refresh
+    expires_in = int(token_json.get("expires_in", 3600))
+    at_exp = _now() + expires_in - 30  # safety buffer
+    rt_exp = None  # Zoho doesn’t provide; keep NULL
+    domain = token_json.get("api_domain") or os.getenv("ZOHO_API_DOMAIN", "www.zohoapis.com")
+    account_id = None
+
+    row = get_latest_row_for_user(user_id)
+    if row is None:
+        _insert_row(user_id, access, refresh, at_exp, rt_exp, domain, account_id)
+    else:
+        _update_row(
+            row["Id"],
+            access=access,
+            refresh=refresh or row["Refresh_Token"],
+            at_exp=at_exp,
+            rt_exp=rt_exp,
+            domain=domain or row["Domain"]
+        )
+
+def clear_tokens_for_user(user_id: int):
+    row = get_latest_row_for_user(user_id)
+    if not row:
+        return
+    with _db() as conn:
+        conn.execute("DELETE FROM Zoho_Channels WHERE Id=?", (row["Id"],))
+        conn.commit()
+
+# ------------ OAuth HTTP helpers ------------
+def zoho_authorize_url(state: str) -> str:
+    params = {
+        "response_type": "code",
+        "client_id": ZOHO_CLIENT_ID,
+        "scope": ZOHO_OAUTH_SCOPE,
+        "redirect_uri": ZOHO_REDIRECT_URI,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return f"https://{ZOHO_ACCOUNTS_URL}/oauth/v2/auth?" + urlencode(params)
+
+def zoho_exchange_code_for_tokens(code: str) -> dict:
+    url = f"https://{ZOHO_ACCOUNTS_URL}/oauth/v2/token"
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": ZOHO_CLIENT_ID,
+        "client_secret": ZOHO_CLIENT_SECRET,
+        "redirect_uri": ZOHO_REDIRECT_URI,
+        "code": code,
+    }
+    r = requests.post(url, data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def zoho_refresh_access_token(refresh_token: str) -> dict:
+    url = f"https://{ZOHO_ACCOUNTS_URL}/oauth/v2/token"
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": ZOHO_CLIENT_ID,
+        "client_secret": ZOHO_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+    }
+    r = requests.post(url, data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def zoho_revoke_token(token: str):
+    url = f"https://{ZOHO_ACCOUNTS_URL}/oauth/v2/token/revoke"
+    r = requests.post(url, params={"token": token}, timeout=20)
+    return r.status_code, r.text
+
+def get_access_token_by_user(user_id: int) -> str | None:
+    row = get_latest_row_for_user(user_id)
+    if not row:
+        return None
+
+    # still valid?
+    if row.get("Access_Token") and row.get("AT_Expiry") and _now() < int(row["AT_Expiry"]):
+        return row["Access_Token"]
+
+    # refresh
+    rt = row.get("Refresh_Token")
+    if not rt:
+        return None
+
+    try:
+        res = zoho_refresh_access_token(rt)
+        save_tokens_for_user(user_id, res)
+        return res.get("access_token")
+    except Exception:
+        logging.exception("Failed to refresh Zoho access token for user_id=%s", user_id)
+        return None
+</file>
+
+<file path=".gitignore">
+.env
+</file>
+
+<file path="app.py">
+import os
+import asyncio
+import logging
+from io import BytesIO
+
+from flask import Flask, request, send_file, jsonify, abort
+from dotenv import load_dotenv
+import stripe
+from playwright.async_api import async_playwright
+import requests
+from datetime import datetime
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Load environment
+load_dotenv("/opt/python/.env")
+
+app = Flask(__name__)
+
+# Stripe config
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+WEBHOOK_LOGFILE = os.getenv("WEBHOOK_LOGFILE", "/var/log/stripe_webhook.log")
+
+# Zoho config
+ZOHO_ACCESS_TOKEN = os.getenv("ZOHO_ACCESS_TOKEN")  # generate & paste from Zoho
+ZOHO_API_DOMAIN = os.getenv("ZOHO_API_DOMAIN", "www.zohoapis.com")
+
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+else:
+    logging.warning("STRIPE_SECRET_KEY not set — Stripe API calls will not work")
+
+# ----------------------------
+# HTML -> PDF ROUTE (unchanged)
+# ----------------------------
+async def generate_pdf_from_html(html_content: str) -> BytesIO:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.set_content(html_content, wait_until="load")
+
+        pdf_bytes = await page.pdf(format="A4", print_background=True)
+        await browser.close()
+
+        return BytesIO(pdf_bytes)
+
+@app.route('/htmltopdf', methods=['POST'])
+def convert_html_to_pdf():
+    try:
+        logging.info(f"Request method: {request.method}")
+        logging.info(f"Content-Type: {request.content_type}")
+        logging.info(f"Headers: {dict(request.headers)}")
+        logging.info(f"Remote Address: {request.remote_addr}")
+        html_content = request.json.get("content", "")
+
+        pdf_file = asyncio.run(generate_pdf_from_html(html_content))
+        logging.info("HTML to PDF converted successfully using Playwright!")
+
+        return send_file(pdf_file, as_attachment=True, download_name="output.pdf", mimetype="application/pdf")
+
+    except Exception as ex:
+        logging.error(f"Error while converting HTML to PDF: {str(ex)}")
+        return {"error": "Failed to generate PDF"}, 500
+
+# ----------------------------
+# STRIPE WEBHOOK ROUTE (fixed)
+# ----------------------------
+
+
+def zoho_headers():
+    return {
+        "Authorization": f"Zoho-oauthtoken {ZOHO_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+def create_contact(customer_details: dict) -> str:
+    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Contacts"
+    payload = {
+        "data": [{
+            "Last_Name": customer_details.get("name") or "Unknown",
+            "Email": customer_details.get("email"),
+            "Phone": customer_details.get("phone"),
+        }]
+    }
+    resp = requests.post(url, json=payload, headers=zoho_headers())
+    resp.raise_for_status()
+    return resp.json()["data"][0]["details"]["id"]
+
+def create_deal(contact_id: str, session_obj: dict) -> str:
+    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Deals"
+    payload = {
+        "data": [{
+            "Deal_Name": f"Payment {session_obj.get('id')}",
+            "Amount": session_obj.get("amount_total", 0) / 100,
+            "Closing_Date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "Contact_Name": {"id": contact_id}
+        }]
+    }
+    resp = requests.post(url, json=payload, headers=zoho_headers())
+    resp.raise_for_status()
+    return resp.json()["data"][0]["details"]["id"]
+
+def update_deal(deal_id: str, session_obj: dict, contact_id: str):
+    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Deals/{deal_id}"
+    payload = {
+        "data": [{
+            # ⚠️ Replace with your actual Zoho field API names
+            "Contribution_Amount": session_obj.get("amount_total", 0) / 100,
+            "Payment_Status": session_obj.get("payment_status"),
+            "Payment_Method": ",".join(session_obj.get("payment_method_types", [])),
+            "Donation_Name": session_obj.get("metadata", {}).get("donation_name", ""),
+            "Sub_Pipeline_and_Stage": "Closed Won",  # replace with your stage field API name
+            "Contact_Name": {"id": contact_id}
+        }]
+    }
+    resp = requests.put(url, json=payload, headers=zoho_headers())
+    resp.raise_for_status()
+    return resp.json()
+
+
+
+@app.before_request
+def log_request_info():
+    try:
+        logging.info("===== Incoming Request =====")
+        logging.info(f"Path: {request.path}")
+        logging.info(f"Method: {request.method}")
+        logging.info(f"Headers: {dict(request.headers)}")
+        logging.info(f"Remote Addr: {request.remote_addr}")
+
+        # Raw body
+        raw_data = request.get_data(as_text=True)
+        if raw_data:
+            logging.info(f"Raw Body: {raw_data}")
+
+        # Parsed JSON (if any)
+        if request.is_json:
+            logging.info(f"JSON: {request.get_json(silent=True)}")
+
+        logging.info("===== End Request =====")
+    except Exception as ex:
+        logging.error(f"Failed to log request: {ex}")
+
+VERIFY_SIGNATURE = os.getenv("STRIPE_VERIFY_SIGNATURE", "true").lower() == "true"
+
+
+@app.route('/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    # raw body bytes for signature verification
+    payload_bytes = request.get_data()
+    try:
+        payload_text = payload_bytes.decode("utf-8")
+    except Exception:
+        payload_text = payload_bytes.decode("utf-8", errors="replace")
+
+    sig_header = request.headers.get('Stripe-Signature')
+    event = None
+
+    if VERIFY_SIGNATURE:
+        if not STRIPE_WEBHOOK_SECRET:
+            logging.error("STRIPE_WEBHOOK_SECRET not configured — cannot verify signatures")
+            return abort(500, description="webhook not configured")
+        if not sig_header:
+            logging.warning("Missing Stripe-Signature header")
+            return abort(400)
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload_bytes,
+                sig_header=sig_header,
+                secret=STRIPE_WEBHOOK_SECRET
+            )
+        except Exception:
+            logging.exception("Signature verification failed")
+            return abort(400)
+    else:
+        logging.warning("⚠️ Skipping signature verification (DEBUG MODE)")
+        try:
+            event = request.get_json(force=True)
+        except Exception:
+            logging.exception("Failed to parse JSON payload without signature check")
+            return abort(400)
+
+    # get id/type safely
+    if isinstance(event, dict):
+        event_id = event.get("id", "no-id")
+        event_type = event.get("type", "no-type")
+    else:
+        event_id = getattr(event, "id", "no-id")
+        event_type = getattr(event, "type", "no-type")
+
+    # Build and append full payload to logfile
+    try:
+        with open(WEBHOOK_LOGFILE, "a") as f:
+            f.write("\n==== STRIPE WEBHOOK ====\n")
+            f.write(f"Timestamp: {__import__('datetime').datetime.utcnow().isoformat()}Z\n")
+            f.write(f"Remote: {request.remote_addr}\n")
+            f.write(f"Event ID: {event_id}\n")
+            f.write(f"Event Type: {event_type}\n")
+            f.write(f"Headers: {dict(request.headers)}\n")
+            f.write("Payload:\n")
+            f.write(payload_text)
+            f.write("\n==== END WEBHOOK ====\n\n")
+    except Exception:
+        logging.exception(f"Failed to write full webhook log: {WEBHOOK_LOGFILE}")
+
+    logging.info(f"Received Stripe event: {event_id} {event_type}")
+    logging.info(f"Payload logged to {WEBHOOK_LOGFILE}")
+ # --- NEW ZOHO INTEGRATION ---
+    if event_type == "checkout.session.completed":
+        session = event["data"]["object"]
+        metadata = session.get("metadata", {}) or {}
+
+        deal_id = metadata.get("deal_id")
+        contact_id = metadata.get("contact_id")
+
+        # If no contact → create
+        if not contact_id:
+            contact_id = create_contact(session.get("customer_details", {}))
+
+        # If no deal → create
+        if not deal_id:
+            deal_id = create_deal(contact_id, session)
+
+        # Always update the deal
+        update_deal(deal_id, session, contact_id)
+
+    return jsonify({"received": True}), 200
+
+# ----------------------------
+# HEALTH CHECK
+# ----------------------------
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+# Optional: default success/cancel URLs (use your front-end URLs)
+DEFAULT_SUCCESS_URL = os.getenv("SUCCESS_URL", "https://example.com/success")
+DEFAULT_CANCEL_URL = os.getenv("CANCEL_URL", "https://example.com/cancel")
+
+def _validate_currency(curr: str) -> str:
+    if not curr:
+        return "usd"
+    return curr.lower()
+
+def _validate_amount_cents(amount) -> int:
+    # Accept dollars (float/int) or cents (int) - normalize to cents
+    if isinstance(amount, (int,)) and amount > 0:
+        return int(amount)  # assume cents
+    try:
+        # if passed as float (dollars) or string "10.50"
+        amt = float(amount)
+        if amt <= 0:
+            raise ValueError("amount must be > 0")
+        return int(round(amt * 100))
+    except Exception:
+        raise ValueError("invalid amount; provide cents (int) or dollars (float)")
+@app.route("/api/create_payment_link", methods=["POST"])
+def create_payment_link():
+    """
+    Create a Stripe Payment Link.
+    Request JSON:
+    {
+      "name": "Awesome Product",
+      "amount": 9.99,        # dollars (float) or cents (int)
+      "currency": "usd",     # optional (default usd)
+      "metadata": {          # optional
+        "order_id": "12345",
+        "customer": "centilio"
+      }
+    }
+    Response:
+    { "url": "https://buy.stripe.com/..." }
+    """
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Stripe not configured"}), 500
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    try:
+        # --- basic input ---
+        name = data.get("name", "Payment")
+        currency = (data.get("currency") or "usd").lower()
+
+        amount = data.get("amount")
+        if amount is None:
+            return jsonify({"error": "amount is required"}), 400
+
+        # Normalize to cents
+        if isinstance(amount, int):
+            amount_cents = amount  # assume already in cents
+        else:
+            amount_cents = int(round(float(amount) * 100))
+
+        # metadata (must be dict of strings)
+        metadata = {}
+        if isinstance(data.get("metadata"), dict):
+            metadata = {str(k): str(v) for k, v in data["metadata"].items()}
+
+        # --- call Stripe ---
+        payment_link = stripe.PaymentLink.create(
+            line_items=[
+                {
+                    "price_data": {
+                        "currency": currency,
+                        "product_data": {"name": name},
+                        "unit_amount": amount_cents,
+                    },
+                    "quantity": 1,
+                }
+            ],
+            metadata=metadata
+        )
+
+        return jsonify({"url": payment_link.url}), 200
+
+    except Exception as ex:
+        logging.exception("Failed to create payment link")
+        return jsonify({"error": str(ex)}), 500
+
+
+
+
+
+# ------------------------------------------------------------------------------
+# Zoho: minimal UI + routes
+# ------------------------------------------------------------------------------
+@app.route("/zoho", methods=["GET"])
+def zoho_page():
+    row = get_latest_row_for_user(ZOHO_USER_ID)
+    connected = row is not None
+    return render_template(
+        "zoho.html",
+        connected=connected,
+        accounts_url=ZOHO_ACCOUNTS_URL,
+        scope=ZOHO_OAUTH_SCOPE,
+        redirect_uri=ZOHO_REDIRECT_URI
+    )
+
+@app.route("/auth", methods=["GET"])
+def auth():
+    state = __import__("secrets").token_urlsafe(24)
+    session["zoho_state"] = state
+    return redirect(zoho_authorize_url(state))
+
+@app.route("/callback", methods=["GET"])
+def callback():
+    error = request.args.get("error")
+    if error:
+        logging.error("Zoho callback error: %s", error)
+        return abort(400, description=error)
+
+    state = request.args.get("state")
+    code = request.args.get("code")
+    if not code or not state or state != session.get("zoho_state"):
+        return abort(400, description="Invalid state or missing code")
+
+    try:
+        token_res = zoho_exchange_code_for_tokens(code)
+        if not token_res.get("access_token") or not token_res.get("refresh_token"):
+            logging.error("Unexpected token payload: %s", token_res)
+            return abort(500, description="Token exchange failed")
+        save_tokens_for_user(ZOHO_USER_ID, token_res)
+        logging.info("Zoho connected. Tokens saved for user_id=%s", ZOHO_USER_ID)
+        return redirect("/zoho")
+    except requests.HTTPError as e:
+        logging.exception("Zoho token exchange HTTP error")
+        return abort(502, description=f"Zoho token exchange failed: {e.response.text}")
+    except Exception:
+        logging.exception("Zoho token exchange error")
+        return abort(500, description="Zoho token exchange failed")
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    row = get_latest_row_for_user(ZOHO_USER_ID)
+    if row and row.get("Refresh_Token"):
+        try:
+            status, body = zoho_revoke_token(row["Refresh_Token"])
+            logging.info("Zoho revoke status=%s body=%s", status, body)
+        except Exception:
+            logging.exception("Zoho revoke failed (continuing to clear local tokens)")
+    clear_tokens_for_user(ZOHO_USER_ID)
+    return redirect("/zoho")
+
+# Example protected Zoho call using always-fresh token
+@app.route("/zoho/me", methods=["GET"])
+def zoho_me():
+    token = get_access_token_by_user(ZOHO_USER_ID)
+    if not token:
+        return abort(401, description="Zoho not connected")
+
+    # Hit a simple endpoint (orgs) as a sanity check
+    resp = requests.get(
+        f"https://{ZOHO_API_DOMAIN}/crm/v2/org",
+        headers={"Authorization": f"Zoho-oauthtoken {token}"},
+        timeout=20
+    )
+    if resp.status_code >= 400:
+        return abort(resp.status_code, resp.text)
+    return jsonify(resp.json())
+    
+
+    
+if __name__ == '__main__':
+    app.run(debug=True, host="0.0.0.0", port=8000)
+</file>
+
+<file path="install_stripe_tar.sh">
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/python"
+ENV_FILE="$APP_DIR/.env"
+USER="webhook"
+LISTEN_SCRIPT="$APP_DIR/run_stripe_listen.sh"
+UNIT_FILE="/etc/systemd/system/stripe-listen.service"
+LOGFILE="/var/log/stripe_listen.log"
+FORWARD_TO="http://127.0.0.1:8000/stripe/webhook"
+EVENTS="checkout.session.completed,payment_intent.succeeded"
+STRIPE_TGZ="stripe_1.30.0_linux_x86_64.tar.gz"
+STRIPE_URL="https://github.com/stripe/stripe-cli/releases/download/v1.30.0/$STRIPE_TGZ"
+
+echo ">>> Step 1: Install Stripe CLI binary"
+cd /tmp
+wget -q "$STRIPE_URL" -O "$STRIPE_TGZ"
+tar -xzf "$STRIPE_TGZ"
+# the archive contains a "stripe" binary
+mv stripe /usr/local/bin/stripe
+chmod +x /usr/local/bin/stripe
+
+echo ">>> Stripe CLI version:"
+stripe version || { echo "Stripe CLI install failed"; exit 1; }
+
+echo ">>> Step 2: Ensure webhook user exists"
+if ! id -u "$USER" >/dev/null 2>&1; then
+  adduser --disabled-password --gecos "" "$USER"
+  usermod -aG sudo "$USER"
+fi
+
+echo ">>> Step 3: Create wrapper script"
+cat > "$LISTEN_SCRIPT" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENVFILE="$ENV_FILE"
+LOGFILE="$LOGFILE"
+FORWARD_TO="$FORWARD_TO"
+EVENTS="$EVENTS"
+
+# load .env if present
+if [ -f "\$ENVFILE" ]; then
+  export \$(grep -v '^#' "\$ENVFILE" | xargs)
+fi
+
+exec stripe listen --api-key "\${STRIPE_SECRET_KEY:-}" \\
+  --forward-to "\$FORWARD_TO" \\
+  --events "\$EVENTS" 2>&1 | tee -a "\$LOGFILE"
+SH
+
+chmod +x "$LISTEN_SCRIPT"
+chown "$USER:$USER" "$LISTEN_SCRIPT"
+
+echo ">>> Step 4: Create systemd unit"
+cat > "$UNIT_FILE" <<UNIT
+[Unit]
+Description=Stripe CLI listener (tar.gz install)
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+Group=$USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$ENV_FILE
+ExecStart=$LISTEN_SCRIPT
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+echo ">>> Step 5: Start service"
+systemctl daemon-reload
+systemctl enable --now stripe-listen
+systemctl status stripe-listen --no-pager -l
+
+echo
+echo ">>> Step 6: Check logs for your webhook signing secret (whsec_...)"
+echo "Run: journalctl -u stripe-listen -f"
+</file>
+
+<file path="README.md">
+# stripe
+</file>
+
+<file path="run_stripe_listen.sh">
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENVFILE="/opt/python/.env"
+LOGFILE="/var/log/stripe_listen.log"
+FORWARD_TO="http://127.0.0.1:8000/stripe/webhook"
+EVENTS="checkout.session.completed,payment_intent.succeeded"
+
+# load .env if present
+if [ -f "$ENVFILE" ]; then
+  export $(grep -v '^#' "$ENVFILE" | xargs)
+fi
+
+exec stripe listen --api-key "${STRIPE_SECRET_KEY:-}" \
+  --forward-to "$FORWARD_TO" \
+  --events "$EVENTS" 2>&1 | tee -a "$LOGFILE"
+</file>
+
+<file path="setup_stripe_listen.sh">
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === CONFIG ===
+APP_DIR="/opt/python"
+ENV_FILE="$APP_DIR/.env"
+STRIPE_BIN="/usr/bin/stripe"
+FORWARD_TO="http://127.0.0.1:8000/stripe/webhook"
+EVENTS="checkout.session.completed,payment_intent.succeeded"
+LISTEN_SCRIPT="$APP_DIR/run_stripe_listen.sh"
+UNIT_FILE="/etc/systemd/system/stripe-listen.service"
+LOGFILE="/var/log/stripe_listen.log"
+USER="webhook"
+
+echo ">>> Step 1: Ensure webhook user exists"
+if ! id -u "$USER" >/dev/null 2>&1; then
+  adduser --disabled-password --gecos "" "$USER"
+  usermod -aG sudo "$USER"
+fi
+
+echo ">>> Step 2: Install Stripe CLI if missing"
+if ! command -v stripe >/dev/null 2>&1; then
+  curl -L https://github.com/stripe/stripe-cli/releases/latest/download/stripe_$(uname -s)_$(uname -m).deb -o /tmp/stripe-cli.deb
+  apt install -y /tmp/stripe-cli.deb
+fi
+
+echo ">>> Step 3: Create wrapper script at $LISTEN_SCRIPT"
+cat > "$LISTEN_SCRIPT" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENVFILE="$ENV_FILE"
+LOGFILE="$LOGFILE"
+STRIPE_BIN="$STRIPE_BIN"
+FORWARD_TO="$FORWARD_TO"
+EVENTS="$EVENTS"
+
+# load .env vars if present
+if [ -f "\$ENVFILE" ]; then
+  export \$(grep -v '^#' "\$ENVFILE" | xargs)
+fi
+
+exec "\$STRIPE_BIN" listen \\
+  --api-key "\${STRIPE_SECRET_KEY:-}" \\
+  --forward-to "\$FORWARD_TO" \\
+  --events "\$EVENTS" 2>&1 | tee -a "\$LOGFILE"
+SH
+
+chmod +x "$LISTEN_SCRIPT"
+chown "$USER:$USER" "$LISTEN_SCRIPT"
+
+echo ">>> Step 4: Create systemd unit $UNIT_FILE"
+cat > "$UNIT_FILE" <<UNIT
+[Unit]
+Description=Stripe CLI listener (forwards events to local webhook)
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+Group=$USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$ENV_FILE
+ExecStart=$LISTEN_SCRIPT
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+echo ">>> Step 5: Reload systemd and start service"
+systemctl daemon-reload
+systemctl enable --now stripe-listen
+
+echo ">>> Step 6: Tail logs for signing secret (Ctrl+C when done)"
+sleep 2
+journalctl -u stripe-listen -n 20 --no-pager
+echo
+echo "⚠️  Look for a line like: 'Your webhook signing secret is whsec_...' above."
+echo "👉 Copy that whsec_... and put it into $ENV_FILE as STRIPE_WEBHOOK_SECRET"
+</file>
+
+</files>
