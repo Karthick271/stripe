@@ -35,6 +35,8 @@ from zoho_oauth import (
     get_access_token_by_user,
     get_latest_row_for_user,
     get_zoho_api_base,
+        clear_tokens_for_user,
+
     # constants used by your template/routes:
     ZOHO_USER_ID,
     ZOHO_OAUTH_SCOPE,
@@ -163,19 +165,45 @@ def create_contact(customer_details: dict) -> str:
     resp.raise_for_status()
     return resp.json()["data"][0]["details"]["id"]
 
-def create_deal(contact_id: str, session_obj: dict) -> str:
-    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Deals"
-    payload = {
-        "data": [{
-            "Deal_Name": f"Payment {session_obj.get('id')}",
-            "Amount": session_obj.get("amount_total", 0) / 100,
-            "Closing_Date": datetime.utcnow().strftime("%Y-%m-%d"),
-            "Contact_Name": {"id": contact_id}
-        }]
+def create_bigin_deal(contact_id: str, session_obj: dict) -> str:
+    """
+    Create a Bigin Deal using Pipeline + Sub_Pipeline + Stage names.
+    Pipeline ID is taken from env.
+    """
+    base = get_zoho_api_base()
+    url = f"{base}/bigin/v2/Pipelines"
+
+    PIPELINE_ID   = os.getenv("ZOHO_BIGIN_PIPELINE_ID")
+    SUB_PIPELINE  = os.getenv("ZOHO_BIGIN_SUB_PIPELINE", "Incoming Donations")
+    STAGE_NAME    = os.getenv("ZOHO_BIGIN_STAGE", "Unreconciled Donations")
+
+    deal_name = f"Donation - {session_obj.get('metadata', {}).get('donation_name','Test')} - {datetime.utcnow().strftime('%b %d')}"
+    amount    = (session_obj.get("amount_total", 0) or 0) / 100.0
+    closing   = datetime.utcnow().strftime("%Y-%m-%d")
+
+    record = {
+        "Deal_Name": deal_name+"-Test",
+        "Pipeline": {"id": PIPELINE_ID} if PIPELINE_ID else None,
+        "Sub_Pipeline": SUB_PIPELINE,
+        "Stage": STAGE_NAME,
+        "Amount": amount,
+        "Closing_Date": closing,
+        "Contact_Name": {"id": contact_id} if contact_id else None,
     }
-    resp = requests.post(url, json=payload, headers=zoho_headers())
+
+    # prune None values
+    record = {k: v for k, v in record.items() if v is not None}
+
+    payload = {"data": [record]}
+    resp = requests.post(url, json=payload, headers=zoho_headers(), timeout=20)
     resp.raise_for_status()
-    return resp.json()["data"][0]["details"]["id"]
+    res = resp.json()
+
+    try:
+        return res["data"][0]["details"]["id"]
+    except Exception:
+        logging.error("Unexpected Bigin response: %s", res)
+        raise
 
 def update_deal(deal_id: str, session_obj: dict, contact_id: str):
     url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Deals/{deal_id}"
@@ -462,6 +490,43 @@ def zoho_me():
         return abort(resp.status_code, resp.text)
 
     return jsonify(resp.json())
+
+
+
+@app.route("/bigin/test-deal", methods=["POST", "GET"])
+def test_bigin_deal():
+    """
+    Quick test endpoint to create a dummy Bigin deal.
+    - GET: uses fixed dummy data
+    - POST: allows sending JSON payload
+    """
+    try:
+        if request.method == "POST" and request.is_json:
+            session_obj = request.get_json()
+        else:
+            # dummy session object for quick manual test
+            session_obj = {
+                "id": "TEST-" + datetime.utcnow().strftime("%Y%m%d%H%M%S"),
+                "amount_total": 2500,  # cents (25.00)
+                "metadata": {"donation_name": "Prototype"},
+            }
+
+        contact_id = request.args.get("contact_id")  # optional override
+        deal_id = create_bigin_deal(contact_id, session_obj)
+
+        return jsonify({"ok": True, "deal_id": deal_id, "session_used": session_obj}), 201
+
+    except requests.HTTPError as http_err:
+        # surface Zoho's exact error
+        return jsonify({
+            "ok": False,
+            "error": "HTTPError",
+            "status": http_err.response.status_code,
+            "body": http_err.response.text
+        }), http_err.response.status_code
+    except Exception as ex:
+        logging.exception("Failed to create test Bigin deal")
+        return jsonify({"ok": False, "error": str(ex)}), 500
 
     
 if __name__ == '__main__':
