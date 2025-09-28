@@ -211,6 +211,46 @@ def create_bigin_deal(contact_id: str, session_obj: dict) -> str:
         logging.error("Unexpected Bigin response: %s", res)
         raise
 
+
+
+def update_bigin_deal(deal_id: str, session_obj: dict, contact_id: str = None):
+    """
+    Update an existing Bigin Pipeline record.
+    Useful to set Payment_Status, Payment_Method, Stage, etc. after payment confirmation.
+    """
+    base = get_zoho_api_base()
+    url = f"{base}/bigin/v2/Pipelines/{deal_id}"  # ✅ update endpoint for Pipelines
+
+    STAGE_NAME = os.getenv("ZOHO_BIGIN_STAGE", "Unreconciled Donations")
+
+    update_data = {
+        "Stage": STAGE_NAME,
+        "Payment_Status": session_obj.get("payment_status"),
+        "Payment_Method": ",".join(session_obj.get("payment_method_types", [])) if session_obj.get("payment_method_types") else None,
+        "Closing_Date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "Contact_Name": {"id": contact_id} if contact_id else None,
+        "Deal_Name": session_obj.get("metadata", {}).get("donation_name", None)
+    }
+
+    # prune None values
+    update_data = {k: v for k, v in update_data.items() if v is not None}
+
+    payload = {"data": [update_data]}
+
+    logging.info(f"Updating Bigin Pipeline Deal: {deal_id}")
+    logging.debug(f"Payload: {payload}")
+
+    resp = requests.put(url, json=payload, headers=zoho_headers(), timeout=20)
+    resp.raise_for_status()
+    res = resp.json()
+
+    if "data" not in res or res["data"][0].get("status") != "success":
+        logging.error("Unexpected update response from Bigin: %s", res)
+        raise RuntimeError(f"Failed to update Bigin deal {deal_id}")
+
+    logging.info(f"Bigin deal {deal_id} updated successfully")
+    return res
+
 def update_deal(deal_id: str, session_obj: dict, contact_id: str):
     url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Deals/{deal_id}"
     payload = {
@@ -331,10 +371,10 @@ def stripe_webhook():
 
         # If no deal → create
         if not deal_id:
-            deal_id = create_deal(contact_id, session)
+            deal_id = create_bigin_deal(contact_id, session)
 
         # Always update the deal
-        update_deal(deal_id, session, contact_id)
+        update_bigin_deal(deal_id, session, contact_id)
 
     return jsonify({"received": True}), 200
 
@@ -367,7 +407,7 @@ def _validate_amount_cents(amount) -> int:
     except Exception:
         raise ValueError("invalid amount; provide cents (int) or dollars (float)")
 
- 
+
 @app.route("/api/create_payment_link", methods=["POST"])
 def create_payment_link():
     """
