@@ -153,7 +153,8 @@ def zoho_headers():
 
 
 def create_contact(customer_details: dict) -> str:
-    url = f"https://{ZOHO_API_DOMAIN}/crm/v2/Contacts"
+    base = get_zoho_api_base()
+    url = f"{base}/bigin/v2/Contacts"  # ✅ you said to keep Pipelines
     payload = {
         "data": [{
             "Last_Name": customer_details.get("name") or "Unknown",
@@ -165,33 +166,38 @@ def create_contact(customer_details: dict) -> str:
     resp.raise_for_status()
     return resp.json()["data"][0]["details"]["id"]
 
+from datetime import datetime, timezone
+
 def create_bigin_deal(contact_id: str, session_obj: dict) -> str:
     """
-    Create a Bigin Deal using Pipeline + Sub_Pipeline + Stage names.
-    Pipeline ID is taken from env.
+    Create a Bigin Pipeline record (not a Deal).
+    Adds Deal_Name, Stage, Payment_Status, and Payment_Method fields.
     """
     base = get_zoho_api_base()
-    url = f"{base}/bigin/v2/Pipelines"
+    url = f"{base}/bigin/v2/Pipelines"  # ✅ you said to keep Pipelines
 
     PIPELINE_ID   = os.getenv("ZOHO_BIGIN_PIPELINE_ID")
     SUB_PIPELINE  = os.getenv("ZOHO_BIGIN_SUB_PIPELINE", "Incoming Donations")
     STAGE_NAME    = os.getenv("ZOHO_BIGIN_STAGE", "Unreconciled Donations")
 
-    deal_name = f"Donation - {session_obj.get('metadata', {}).get('donation_name','Test')} - {datetime.utcnow().strftime('%b %d')}"
+    deal_name = f"Donation - {session_obj.get('metadata', {}).get('donation_name','Test')} - {datetime.now(timezone.utc).strftime('%b %d')}"
     amount    = (session_obj.get("amount_total", 0) or 0) / 100.0
-    closing   = datetime.utcnow().strftime("%Y-%m-%d")
+    closing   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     record = {
-        "Deal_Name": deal_name+"-Test",
+        "Deal_Name": deal_name + "-Test",
         "Pipeline": {"id": PIPELINE_ID} if PIPELINE_ID else None,
         "Sub_Pipeline": SUB_PIPELINE,
         "Stage": STAGE_NAME,
         "Amount": amount,
         "Closing_Date": closing,
         "Contact_Name": {"id": contact_id} if contact_id else None,
+        # ✅ Extra fields you asked
+        "Payment_Status": session_obj.get("payment_status"),
+        "Payment_Method": ",".join(session_obj.get("payment_method_types", [])) if session_obj.get("payment_method_types") else None,
     }
 
-    # prune None values
+    # Remove any None/empty
     record = {k: v for k, v in record.items() if v is not None}
 
     payload = {"data": [record]}
@@ -360,6 +366,8 @@ def _validate_amount_cents(amount) -> int:
         return int(round(amt * 100))
     except Exception:
         raise ValueError("invalid amount; provide cents (int) or dollars (float)")
+
+ 
 @app.route("/api/create_payment_link", methods=["POST"])
 def create_payment_link():
     """
@@ -528,6 +536,46 @@ def test_bigin_deal():
         logging.exception("Failed to create test Bigin deal")
         return jsonify({"ok": False, "error": str(ex)}), 500
 
-    
+
+@app.route("/bigin/test-contact", methods=["POST", "GET"])
+def test_bigin_contact():
+    """
+    Quick test endpoint to create a Bigin Contact.
+    - GET: uses dummy data
+    - POST: accepts JSON {name, email, phone}
+    Optional query param: ?phone=... (will override body)
+    """
+    try:
+        if request.method == "POST" and request.is_json:
+            data = request.get_json()
+        else:
+            # dummy defaults for GET
+            data = {
+                "name": "Prototype User",
+                "email": f"proto+{__import__('time').time_ns()}@example.com",
+                "phone": "9990001111",
+            }
+
+        # allow quick override via query (handy from browser)
+        q_phone = request.args.get("phone")
+        if q_phone:
+            data["phone"] = q_phone
+
+        contact_id = create_contact(data)
+        return jsonify({"ok": True, "contact_id": contact_id, "sent": data}), 201
+
+    except requests.HTTPError as e:
+        # surface Zoho error cleanly
+        return jsonify({
+            "ok": False,
+            "status": e.response.status_code,
+            "body": e.response.text
+        }), e.response.status_code
+    except Exception as ex:
+        logging.exception("test_bigin_contact failed")
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+
 if __name__ == '__main__':
     app.run(debug=True, host="0.0.0.0", port=8000)
